@@ -23,10 +23,8 @@
 #include "config.h"
 
 /* local include */
-#include "vrrp_ipaddress.h"
 #include "vrrp_iproute.h"
 #include "keepalived_netlink.h"
-#include "vrrp_if.h"
 #include "vrrp_data.h"
 #include "logger.h"
 #include "memory.h"
@@ -35,7 +33,7 @@
 #include "vrrp_ip_rule_route_parser.h"
 
 #include <linux/icmpv6.h>
-#include <linux/rtnetlink.h>
+#include <inttypes.h>
 #if HAVE_DECL_RTA_ENCAP
 #include <linux/lwtunnel.h>
 #if HAVE_DECL_LWTUNNEL_ENCAP_MPLS
@@ -45,8 +43,9 @@
 #include <linux/ila.h>
 #endif
 #endif
-#include <inttypes.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <linux/rtnetlink.h>
 
 /* Buffer sizes for netlink messages. Increase if needed. */
 #define	RTM_SIZE		1024
@@ -336,13 +335,14 @@ netlink_route(ip_route_t *iproute, int cmd)
 			req.r.rtm_type = iproute->type;
 	}
 	else {
-		req.r.rtm_protocol = RTPROT_BOOT;
 		req.r.rtm_scope = RT_SCOPE_UNIVERSE;
 		req.r.rtm_type = iproute->type;
 	}
 
 	if (iproute->mask & IPROUTE_BIT_PROTOCOL)
 		req.r.rtm_protocol = iproute->protocol;
+	else
+		req.r.rtm_protocol = RTPROT_KEEPALIVED;
 
 	if (iproute->mask & IPROUTE_BIT_SCOPE)
 		req.r.rtm_scope = iproute->scope;
@@ -390,7 +390,7 @@ netlink_route(ip_route_t *iproute, int cmd)
 
 	if (iproute->mask & IPROUTE_BIT_DSFIELD)
 		req.r.rtm_tos = iproute->tos;
-	
+
 	if (iproute->oif)
 		addattr32(&req.n, sizeof(req), RTA_OIF, iproute->oif->ifindex);
 
@@ -486,7 +486,7 @@ netlink_route(ip_route_t *iproute, int cmd)
 	op += (size_t)snprintf(op, sizeof(lbuf) - (op - lbuf), "nlmsghdr %p(%u):", &req.n, req.n.nlmsg_len);
 	for (i = 0, p = (uint8_t*)&req.n; i < sizeof(struct nlmsghdr); i++)
 		op += (size_t)snprintf(op, sizeof(lbuf) - (op - lbuf), " %2.2hhx", *(p++));
-	log_message(LOG_INFO, "%s\n", lbuf);
+	log_message(LOG_INFO, "%s", lbuf);
 
 	op = lbuf;
 	op += (size_t)snprintf(op, sizeof(lbuf) - (op - lbuf), "rtmsg %p(%lu):", &req.r, req.n.nlmsg_len - sizeof(struct nlmsghdr));
@@ -494,7 +494,7 @@ netlink_route(ip_route_t *iproute, int cmd)
 		op += (size_t)snprintf(op, sizeof(lbuf) - (op - lbuf), " %2.2hhx", *(p++));
 
 	for (j = 0; lbuf + j < op; j+= MAX_LOG_MSG)
-		log_message(LOG_INFO, "%.*\n", MAX_LOG_MSG, lbuf+j);
+		log_message(LOG_INFO, "%.*", MAX_LOG_MSG, lbuf+j);
 #endif
 
 	/* This returns ESRCH if the address of via address doesn't exist */
@@ -681,18 +681,19 @@ format_iproute(ip_route_t *route, char *buf, size_t buf_len)
 	char *op = buf;
 	const char *buf_end = buf + buf_len;
 	nexthop_t *nh;
+	interface_t *ifp;
 	element e;
 
 	if (route->type != RTN_UNICAST)
-		op += (size_t)snprintf(op, (size_t)(buf_end - op), " %s", get_rttables_rtntype(route->type));
+		op += (size_t)snprintf(op, (size_t)(buf_end - op), "%s ", get_rttables_rtntype(route->type));
 	if (route->dst) {
-		op += (size_t)snprintf(op, (size_t)(buf_end - op), " %s", ipaddresstos(NULL, route->dst));
+		op += (size_t)snprintf(op, (size_t)(buf_end - op), "%s", ipaddresstos(NULL, route->dst));
 		if ((route->dst->ifa.ifa_family == AF_INET && route->dst->ifa.ifa_prefixlen != 32 ) ||
 		    (route->dst->ifa.ifa_family == AF_INET6 && route->dst->ifa.ifa_prefixlen != 128 ))
 			op += (size_t)snprintf(op, (size_t)(buf_end - op), "/%u", route->dst->ifa.ifa_prefixlen);
 	}
 	else
-		op += (size_t)snprintf(op, (size_t)(buf_end - op), " %s", "default");
+		op += (size_t)snprintf(op, (size_t)(buf_end - op), "%s", "default");
 
 	if (route->src) {
 		op += (size_t)snprintf(op, (size_t)(buf_end - op), " from %s", ipaddresstos(NULL, route->src));
@@ -879,10 +880,25 @@ format_iproute(ip_route_t *route, char *buf, size_t buf_len)
 #endif
 		}
 	}
+
+	if (route->dont_track)
+		op += (size_t)snprintf(op, (size_t)(buf_end - op), " no_track");
+
+	if (route->track_group)
+		op += (size_t)snprintf(op, (size_t)(buf_end - op), " track_group %s", route->track_group->gname);
+
+	if (route->set &&
+	    !route->dont_track &&
+	    (!route->oif || route->oif->ifindex != route->configured_ifindex)) {
+		if ((ifp = if_get_by_ifindex(route->configured_ifindex)))
+			op += (size_t)snprintf(op, (size_t)(buf_end - op), " [dev %s]", ifp->ifname);
+		else
+			op += (size_t)snprintf(op, (size_t)(buf_end - op), " [installed ifindex %d]", route->configured_ifindex);
+	}
 }
 
 void
-dump_iproute(void *rt_data)
+dump_iproute(FILE *fp, void *rt_data)
 {
 	ip_route_t *route = rt_data;
 	char *buf = MALLOC(ROUTE_BUF_SIZE);
@@ -891,8 +907,12 @@ dump_iproute(void *rt_data)
 
 	format_iproute(route, buf, ROUTE_BUF_SIZE);
 
-	for (i = 0, len = strlen(buf); i < len; i += i ? MAX_LOG_MSG - 7 : MAX_LOG_MSG - 5)
-		log_message(LOG_INFO, "%*s%s", i ? 7 : 5, "", buf + i);
+	if (fp)
+		conf_write(fp, "%*s%s", 5, "", buf);
+	else {
+		for (i = 0, len = strlen(buf); i < len; i += i ? MAX_LOG_MSG - 7 : MAX_LOG_MSG - 5)
+			conf_write(fp, "%*s%s", i ? 6 : 5, "", buf + i);
+	}
 
 	FREE(buf);
 }
@@ -1194,11 +1214,10 @@ parse_nexthops(vector_t *strvec, unsigned int i, ip_route_t *route)
 					route->family = new->addr->ifa.ifa_family;
 			}
 			else if (!strcmp(str, "dev")) {
-				new->ifp = if_get_by_ifname(strvec_slot(strvec, ++i));
+				str = strvec_slot(strvec, ++i);
+				new->ifp = if_get_by_ifname(str, IF_CREATE_IF_DYNAMIC);
 				if (!new->ifp) {
-					log_message(LOG_INFO, "VRRP is trying to assign VROUTE to unknown "
-					       "%s interface !!! go out and fix your conf !!!",
-					       FMT_STR_VSLOT(strvec, i));
+					log_message(LOG_INFO, "WARNING - interface %s for VROUTE nexthop doesn't exist", str);
 					goto err;
 				}
 			}
@@ -1263,7 +1282,7 @@ err:
 }
 
 void
-alloc_route(list rt_list, vector_t *strvec)
+alloc_route(list rt_list, vector_t *strvec, bool allow_track_group)
 {
 	ip_route_t *new;
 	interface_t *ifp;
@@ -1275,6 +1294,7 @@ alloc_route(list rt_list, vector_t *strvec)
 	bool raw;
 	ip_address_t *dst;
 	uint8_t family;
+	char *dest = NULL;
 
 	new = (ip_route_t *) MALLOC(sizeof(ip_route_t));
 
@@ -1412,11 +1432,10 @@ alloc_route(list rt_list, vector_t *strvec)
 			new->mask |= IPROUTE_BIT_METRIC;
 		}
 		else if (!strcmp(str, "dev") || !strcmp(str, "oif")) {
-			ifp = if_get_by_ifname(strvec_slot(strvec, ++i));
+			str = strvec_slot(strvec, ++i);
+			ifp = if_get_by_ifname(str, IF_CREATE_IF_DYNAMIC);
 			if (!ifp) {
-				log_message(LOG_INFO, "VRRP is trying to assign VROUTE to unknown "
-				       "%s interface !!! go out and fix your conf !!!",
-				       FMT_STR_VSLOT(strvec, i));
+				log_message(LOG_INFO, "WARNING - interface %s for VROUTE nexthop doesn't exist", str);
 				goto err;
 			}
 			new->oif = ifp;
@@ -1591,7 +1610,7 @@ alloc_route(list rt_list, vector_t *strvec)
 			}
 			str = strvec_slot(strvec, i);
 			new->congctl = malloc(strlen(str) + 1);
-			strcpy(new->congctl, str); 
+			strcpy(new->congctl, str);
 #else
 			log_message(LOG_INFO, "%s not supported by kernel", "congctl for route");
 #endif
@@ -1667,6 +1686,17 @@ alloc_route(list rt_list, vector_t *strvec)
 				do_nexthop = true;
 			break;
 		}
+		else if (!strcmp(str, "no_track"))
+			new->dont_track = true;
+		else if (allow_track_group && !strcmp(str, "track_group")) {
+			i++;
+			if (new->track_group) {
+				log_message(LOG_INFO, "track_group %s is a duplicate", FMT_STR_VSLOT(strvec, i));
+				break;
+			}
+			if (!(new->track_group = find_track_group(strvec_slot(strvec, i))))
+				log_message(LOG_INFO, "track_group %s not found", FMT_STR_VSLOT(strvec, i));
+		}
 		else {
 			if (!strcmp(str, "to"))
 				i++;
@@ -1678,15 +1708,16 @@ alloc_route(list rt_list, vector_t *strvec)
 			}
 			if (new->dst)
 				FREE(new->dst);
-			dst = parse_ipaddress(NULL, strvec_slot(strvec, i), true);
+			dest = strvec_slot(strvec, i);
+			dst = parse_ipaddress(NULL, dest, true);
 			if (!dst) {
-				log_message(LOG_INFO, "unknown route keyword %s", FMT_STR_VSLOT(strvec, i));
+				log_message(LOG_INFO, "unknown route keyword %s", dest);
 				goto err;
 			}
 			if (new->family == AF_UNSPEC)
 				new->family = dst->ifa.ifa_family;
 			else if (new->family != dst->ifa.ifa_family) {
-				log_message(LOG_INFO, "Cannot mix IPv4 and IPv6 addresses for route");
+				log_message(LOG_INFO, "Cannot mix IPv4 and IPv6 addresses for route (%s)", dest);
 				goto err;
 			}
 			new->dst = dst;
@@ -1699,6 +1730,33 @@ alloc_route(list rt_list, vector_t *strvec)
 	else if (i < vector_size(strvec)) {
 		log_message(LOG_INFO, "Route has trailing nonsense - %s", FMT_STR_VSLOT(strvec, i));
 		goto err;
+	}
+
+	if (!new->dst) {
+		log_message(LOG_INFO, "Route must have a destination");
+		goto err;
+	}
+
+	if (!new->dont_track) {
+		if ((new->mask & IPROUTE_BIT_PROTOCOL) && new->protocol != RTPROT_KEEPALIVED)
+			log_message(LOG_INFO, "Route cannot be tracked if protocol is not RTPROT_KEEPALIVED(%d), resetting protocol", RTPROT_KEEPALIVED);
+		new->protocol = RTPROT_KEEPALIVED;
+		new->mask |= IPROUTE_BIT_PROTOCOL;
+
+		if (!new->oif) {
+			/* Alternative is to track oif from when route last added.
+			 * The interface will need to be added temporarily. tracking_vrrp_t will need
+			 * a flag to specify permanent track, and a counter for number of temporary
+			 * trackers. If the termporary tracker count becomes 0 and there is no permanent
+			 * track, then the tracking_vrrp_t will need to be removed. */
+			log_message(LOG_INFO, "Warning - cannot track route %s with no interface specified, not tracking", dest);
+			new->dont_track = true;
+		}
+	}
+
+	if (new->track_group && !new->oif) {
+		log_message(LOG_INFO, "Static route cannot have track group if no oif specified");
+		new->track_group = NULL;
 	}
 
 	list_add(rt_list, new);
@@ -1774,4 +1832,15 @@ void
 clear_diff_sroutes(void)
 {
 	clear_diff_routes(old_vrrp_data->static_routes, vrrp_data->static_routes);
+}
+
+void
+reinstate_static_route(ip_route_t *route)
+{
+	char buf[256];
+
+	route->set = (netlink_route(route, IPROUTE_ADD) > 0);
+
+	format_iproute(route, buf, sizeof(buf));
+	log_message(LOG_INFO, "Restoring deleted static route %s", buf);
 }

@@ -24,23 +24,39 @@
 #include "config.h"
 
 /* global includes */
+#include <errno.h>
+#ifdef NETLINK_H_NEEDS_SYS_SOCKET_H
 #include <sys/socket.h>
+#endif
 #include <linux/fib_rules.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#if HAVE_DECL_FRA_IP_PROTO
+#include <netdb.h>
+#include <inttypes.h>
+#endif
 
 /* local include */
-#include "vrrp_ipaddress.h"
 #include "vrrp_iproute.h"
 #include "vrrp_iprule.h"
 #include "keepalived_netlink.h"
-#include "vrrp_if.h"
 #include "vrrp_data.h"
 #include "logger.h"
 #include "memory.h"
 #include "utils.h"
 #include "rttables.h"
 #include "vrrp_ip_rule_route_parser.h"
+
+/* Since we will be adding and deleting rules in potentially random
+ * orders due to master/backup transitions, we therefore need to
+ * pre-allocate priorities to ensure the rules are added in a consistent
+ * sequence. Really the configuration should specify a priority for each
+ * rule to ensure they are configured in the order the user wants. */
+#define RULE_START_PRIORITY 16384
+static unsigned next_rule_priority_ipv4 = RULE_START_PRIORITY;
+static unsigned next_rule_priority_ipv6 = RULE_START_PRIORITY;
 
 /* Utility functions */
 static inline bool
@@ -71,20 +87,58 @@ rule_is_equal(const ip_rule_t *x, const ip_rule_t *y)
 #if HAVE_DECL_FRA_L3MDEV
 	    x->l3mdev != y->l3mdev ||
 #endif
-	    !(x->iif) != !(y->iif) ||
-	    !(x->oif) != !(y->oif) ||
+	    x->iif != y->iif ||
+#if HAVE_DECL_FRA_OIFNAME
+	    x->oif != y->oif ||
+#endif
+#if HAVE_DECL_FRA_PROTOCOL
+	    x->protocol != y->protocol ||
+#endif
+#if HAVE_DECL_FRA_IP_PROTO
+	    x->ip_proto != y->ip_proto ||
+#endif
+#if HAVE_DECL_FRA_SPORT_RANGE
+	    x->src_port.start != y->src_port.start ||
+	    x->src_port.end != y->src_port.end ||
+#endif
+#if HAVE_DECL_FRA_DPORT_RANGE
+	    x->dst_port.start != y->dst_port.start ||
+	    x->dst_port.end != y->dst_port.end ||
+#endif
 	    x->goto_target != y->goto_target ||
 	    x->table != y->table ||
 	    x->action != y->action)
 		return false;
 
-	if (x->iif && x->iif->ifindex != y->iif->ifindex)
-		return false;
-	if (x->oif && x->oif->ifindex != y->oif->ifindex)
-		return false;
-
 	return true;
 }
+
+#if HAVE_DECL_FRA_IP_PROTO
+static int
+inet_proto_a2n(const char *buf)
+{
+	struct protoent *pe;
+	unsigned long proto_num;
+	char *endptr;
+
+	if (!*buf)
+		return -1;
+
+	proto_num = strtoul(buf, &endptr, 10);
+	if (endptr != buf && !*endptr)
+		return -1;
+	if (proto_num >INT_MAX)
+		return -1;
+
+	pe = getprotobyname(buf);
+	endprotoent();
+
+	if (pe)
+		return pe->p_proto;
+
+	return -1;
+}
+#endif
 
 /* Add/Delete IP rule to/from a specific IP/network */
 static int
@@ -113,13 +167,8 @@ netlink_rule(ip_rule_t *iprule, int cmd)
 	}
 	req.frh.table = RT_TABLE_UNSPEC;
 	req.frh.flags = 0;
-
-	if (iprule->from_addr)
-		req.frh.family = IP_FAMILY(iprule->from_addr);
-	else if (iprule->to_addr)
-		req.frh.family = IP_FAMILY(iprule->to_addr);
-	else
-		req.frh.family = AF_INET;
+	req.frh.tos = iprule->tos;	// Hex value - 0xnn <= 255, or name from rt_dsfield
+	req.frh.family = iprule->family;
 
 	if (iprule->action == FR_ACT_TO_TBL
 #if HAVE_DECL_FRA_L3MDEV
@@ -150,9 +199,6 @@ netlink_rule(ip_rule_t *iprule, int cmd)
 	if (iprule->mask & IPRULE_BIT_PRIORITY)	// "priority/order/preference"
 		addattr32(&req.n, sizeof(req), FRA_PRIORITY, iprule->priority);
 
-	if (iprule->mask & IPRULE_BIT_DSFIELD)	// "tos/dsfield"
-		req.frh.tos = iprule->tos;	// Hex value - 0xnn <= 255, or name from rt_dsfield
-
 	if (iprule->mask & IPRULE_BIT_FWMARK)	// "fwmark"
 		addattr32(&req.n, sizeof(req), FRA_FWMARK, iprule->fwmark);
 
@@ -163,7 +209,7 @@ netlink_rule(ip_rule_t *iprule, int cmd)
 		addattr32(&req.n, sizeof(req), FRA_FLOW, iprule->realms);
 
 #if HAVE_DECL_FRA_SUPPRESS_PREFIXLEN
-	if (iprule->mask & IPRULE_BIT_SUP_PREFIXLEN)	// "suppress_prefixlength" - only valid if table !=0
+	if (iprule->suppress_prefix_len != -1)	// "suppress_prefixlength" - only valid if table != 0
 		addattr32(&req.n, sizeof(req), FRA_SUPPRESS_PREFIXLEN, iprule->suppress_prefix_len);
 #endif
 
@@ -195,6 +241,26 @@ netlink_rule(ip_rule_t *iprule, int cmd)
 		addattr8(&req.n, sizeof(req), FRA_L3MDEV, 1);
 #endif
 
+#if HAVE_DECL_FRA_PROTOCOL
+	if (iprule->mask & IPRULE_BIT_PROTOCOL)
+		addattr8(&req.n, sizeof(req), FRA_PROTOCOL, iprule->protocol);
+#endif
+
+#if HAVE_DECL_FRA_IP_PROTO
+	if (iprule->mask & IPRULE_BIT_IP_PROTO)
+		addattr8(&req.n, sizeof(req), FRA_IP_PROTO, iprule->ip_proto);
+#endif
+
+#if HAVE_DECL_FRA_SPORT_RANGE
+	if (iprule->mask & IPRULE_BIT_SPORT_RANGE)
+		addattr_l(&req.n, sizeof(req), FRA_SPORT_RANGE, &iprule->src_port, sizeof(iprule->src_port));
+#endif
+
+#if HAVE_DECL_FRA_DPORT_RANGE
+	if (iprule->mask & IPRULE_BIT_DPORT_RANGE)
+		addattr_l(&req.n, sizeof(req), FRA_DPORT_RANGE, &iprule->dst_port, sizeof(iprule->dst_port));
+#endif
+
 	if (iprule->action == FR_ACT_GOTO) {	// "goto"
 		addattr32(&req.n, sizeof(req), FRA_GOTO, iprule->goto_target);
 		req.frh.action = FR_ACT_GOTO;
@@ -206,6 +272,17 @@ netlink_rule(ip_rule_t *iprule, int cmd)
 		status = -1;
 
 	return status;
+}
+
+void
+reinstate_static_rule(ip_rule_t *rule)
+{
+	char buf[256];
+
+	rule->set = (netlink_rule(rule, IPRULE_ADD) > 0);
+
+	format_iprule(rule, buf, sizeof(buf));
+	log_message(LOG_INFO, "Restoring deleted static rule %s", buf);
 }
 
 void
@@ -222,7 +299,7 @@ netlink_rulelist(list rule_list, int cmd, bool force)
 	 * rule might not exist. That's not an error, so indicate not
 	 * to report such a situation */
 	if (force && cmd == IPRULE_DEL)
-	         netlink_error_ignore = ENOENT;
+		netlink_error_ignore = ENOENT;
 
 	for (e = LIST_HEAD(rule_list); e; ELEMENT_NEXT(e)) {
 		iprule = ELEMENT_DATA(e);
@@ -256,8 +333,11 @@ format_iprule(ip_rule_t *rule, char *buf, size_t buf_len)
 	char *op = buf;
 	char *buf_end = buf + buf_len;
 
+	if (!rule->to_addr && !rule->from_addr && rule->family == AF_INET6)
+		op += snprintf(op, (size_t)(buf_end - op), "inet6 ");
+
 	if (rule->invert)
-		op += snprintf(op, (size_t)(buf_end - op), " not");
+		op += snprintf(op, (size_t)(buf_end - op), "not ");
 
 	if (rule->from_addr) {
 		op += snprintf(op, (size_t)(buf_end - op), "from %s", ipaddresstos(NULL, rule->from_addr));
@@ -278,8 +358,7 @@ format_iprule(ip_rule_t *rule, char *buf, size_t buf_len)
 	if (rule->mask & IPRULE_BIT_PRIORITY)
 		op += snprintf(op, (size_t)(buf_end - op), " priority %u", rule->priority);
 
-	if (rule->mask & IPRULE_BIT_DSFIELD)
-		op += snprintf(op, (size_t)(buf_end - op), " tos 0x%x", rule->tos);
+	op += snprintf(op, (size_t)(buf_end - op), " tos 0x%x", rule->tos);
 
 	if (rule->mask & (IPRULE_BIT_FWMARK | IPRULE_BIT_FWMASK)) {
 		op += snprintf(op, (size_t)(buf_end - op), " fwmark 0x%x", rule->fwmark);
@@ -301,7 +380,7 @@ format_iprule(ip_rule_t *rule, char *buf, size_t buf_len)
 #endif
 
 #if HAVE_DECL_FRA_SUPPRESS_PREFIXLEN
-	if (rule->mask & IPRULE_BIT_SUP_PREFIXLEN)
+	if (rule->suppress_prefix_len != -1)
 		op += snprintf(op, (size_t)(buf_end - op), " suppress_prefixlen %u", rule->suppress_prefix_len);
 #endif
 
@@ -325,6 +404,26 @@ format_iprule(ip_rule_t *rule, char *buf, size_t buf_len)
 		op += snprintf(op, (size_t)(buf_end - op), " l3mdev");
 #endif
 
+#if HAVE_DECL_FRA_PROTOCOL
+	if (rule->mask & IPRULE_BIT_PROTOCOL)
+		op += snprintf(op, (size_t)(buf_end - op), " protocol %u", rule->protocol);
+#endif
+
+#if HAVE_DECL_FRA_IP_PROTO
+	if (rule->mask & IPRULE_BIT_IP_PROTO)
+		op += snprintf(op, (size_t)(buf_end - op), " ipproto %u", rule->ip_proto);
+#endif
+
+#if HAVE_DECL_FRA_SPORT_RANGE
+	if (rule->mask & IPRULE_BIT_SPORT_RANGE)
+		op += snprintf(op, (size_t)(buf_end - op), " sport %hu-%hu", rule->src_port.start, rule->src_port.end);
+#endif
+
+#if HAVE_DECL_FRA_DPORT_RANGE
+	if (rule->mask & IPRULE_BIT_DPORT_RANGE)
+		op += snprintf(op, (size_t)(buf_end - op), " dport %hu-%hu", rule->dst_port.start, rule->dst_port.end);
+#endif
+
 	if (rule->realms)
 		op += snprintf(op, (size_t)(buf_end - op), " realms %d/%d", rule->realms >> 16, rule->realms & 0xffff);
 
@@ -336,23 +435,27 @@ format_iprule(ip_rule_t *rule, char *buf, size_t buf_len)
 		op += snprintf(op, (size_t)(buf_end - op), " nop");
 	else
 		op += snprintf(op, (size_t)(buf_end - op), " type %s", get_rttables_rtntype(rule->action));
+	if (rule->dont_track)
+		op += snprintf(op, (size_t)(buf_end - op), " no_track");
+	if (rule->track_group)
+		op += snprintf(op, (size_t)(buf_end - op), " track_group %s", rule->track_group->gname);
 }
 
 void
-dump_iprule(void *rule_data)
+dump_iprule(FILE *fp, void *rule_data)
 {
 	ip_rule_t *rule = rule_data;
 	char *buf = MALLOC(RULE_BUF_SIZE);
 
 	format_iprule(rule, buf, RULE_BUF_SIZE);
 
-	log_message(LOG_INFO, "     %s", buf);
+	conf_write(fp, "     %s", buf);
 
 	FREE(buf);
 }
 
 void
-alloc_rule(list rule_list, vector_t *strvec)
+alloc_rule(list rule_list, vector_t *strvec, __attribute__((unused)) bool allow_track_group)
 {
 	ip_rule_t *new;
 	char *str;
@@ -372,6 +475,20 @@ alloc_rule(list rule_list, vector_t *strvec)
 	}
 
 	new->action = FR_ACT_UNSPEC;
+#if HAVE_DECL_FRA_SUPPRESS_PREFIXLEN
+	new->suppress_prefix_len = -1;
+#endif
+
+	/* Check if inet4/6 specified */
+	str = strvec_slot(strvec, i);
+	if (!strcmp(str, "inet6")) {
+		family = AF_INET6;
+		i++;
+	}
+	else if (!strcmp(str, "inet")) {
+		family = AF_INET;
+		i++;
+	}
 
 	/* FMT parse */
 	while (i < vector_size(strvec)) {
@@ -448,7 +565,6 @@ alloc_rule(list rule_list, vector_t *strvec)
 			}
 
 			new->tos = uval8;
-			new->mask |= IPRULE_BIT_DSFIELD;
 		}
 		else if (!strcmp(str, "fwmark")) {
 			str = strvec_slot(strvec, ++i);
@@ -461,7 +577,7 @@ alloc_rule(list rule_list, vector_t *strvec)
 			if (*end == '/') {
 				if (end[1] == '-')
 					goto fwmark_err;
-					
+
 				val1 = strtoul(end+1, &end, 0);
 				if (val1 > UINT32_MAX)
 					goto fwmark_err;
@@ -509,8 +625,7 @@ fwmark_err:
 				log_message(LOG_INFO, "Invalid suppress_prefixlength %s specified", str);
 				goto err;
 			}
-			new->suppress_prefix_len = (uint32_t)val;
-			new->mask |= IPRULE_BIT_SUP_PREFIXLEN;
+			new->suppress_prefix_len = (int32_t)val;
 			table_option = true;
 		}
 #endif
@@ -527,9 +642,9 @@ fwmark_err:
 #endif
 		else if (!strcmp(str, "dev") || !strcmp(str, "iif")) {
 			str = strvec_slot(strvec, ++i);
-			ifp = if_get_by_ifname(str);
+			ifp = if_get_by_ifname(str, IF_CREATE_IF_DYNAMIC);
 			if (!ifp) {
-				log_message(LOG_INFO, "Unknown interface %s for rule",  str);
+				log_message(LOG_INFO, "WARNING - interface %s for rule doesn't exist",  str);
 				goto err;
 			}
 			new->iif = ifp;
@@ -537,9 +652,9 @@ fwmark_err:
 #if HAVE_DECL_FRA_OIFNAME
 		else if (!strcmp(str, "oif")) {
 			str = strvec_slot(strvec, ++i);
-			ifp = if_get_by_ifname(str);
+			ifp = if_get_by_ifname(str, IF_CREATE_IF_DYNAMIC);
 			if (!ifp) {
-				log_message(LOG_INFO, "Unknown interface %s for rule",  str);
+				log_message(LOG_INFO, "WARNING - interface %s for rule doesn't exist",  str);
 				goto err;
 			}
 			new->oif = ifp;
@@ -576,6 +691,75 @@ fwmark_err:
 				goto err;
 			}
 			new->action = FR_ACT_TO_TBL;
+		}
+#endif
+#if HAVE_DECL_FRA_PROTOCOL
+		else if (!strcmp(str, "protocol")) {
+			char *endptr;
+			unsigned long protocol = strtoul(strvec_slot(strvec, ++i), &endptr, 10);
+			if (protocol > UINT8_MAX || *endptr)
+				log_message(LOG_INFO, "Invalid protocol %s", FMT_STR_VSLOT(strvec, i));
+			else {
+				new->protocol = protocol;
+				new->mask |= IPRULE_BIT_PROTOCOL;
+			}
+		}
+#endif
+#if HAVE_DECL_FRA_IP_PROTO
+		else if (!strcmp(str, "ipproto")) {
+			int ip_proto = inet_proto_a2n(strvec_slot(strvec, ++i));
+			if (ip_proto < 0 || ip_proto > UINT8_MAX)
+				log_message(LOG_INFO, "Invalid ipproto %s", FMT_STR_VSLOT(strvec, i));
+			else {
+				new->ip_proto = ip_proto;
+				new->mask |= IPRULE_BIT_IP_PROTO;
+			}
+		}
+#endif
+#if HAVE_DECL_FRA_SPORT_RANGE
+		else if (!strcmp(str, "sport")) {
+			struct fib_rule_port_range sport;
+			int ret;
+
+			ret = sscanf(strvec_slot(strvec, ++i), "%hu-%hu", &sport.start, &sport.end);
+			if (ret == 1)
+				sport.end = sport.start;
+			if (ret != 2)
+				log_message(LOG_INFO, "invalid sport range %s", FMT_STR_VSLOT(strvec, i));
+			else {
+				new->src_port = sport;
+				new->mask |= IPRULE_BIT_SPORT_RANGE;
+			}
+		}
+#endif
+#if HAVE_DECL_FRA_DPORT_RANGE
+		else if (!strcmp(str, "dport")) {
+			struct fib_rule_port_range dport;
+			int ret;
+
+			ret = sscanf(strvec_slot(strvec, ++i), "%hu-%hu", &dport.start, &dport.end);
+			if (ret == 1)
+				dport.end = dport.start;
+			if (ret != 2)
+				log_message(LOG_INFO, "invalid dport range %s", FMT_STR_VSLOT(strvec, i));
+			else {
+				new->dst_port = dport;
+				new->mask |= IPRULE_BIT_DPORT_RANGE;
+			}
+		}
+#endif
+
+		else if (!strcmp(str, "no_track"))
+			new->dont_track = true;
+#if HAVE_DECL_FRA_OIFNAME
+		else if (allow_track_group && !strcmp(str, "track_group")) {
+			i++;
+			if (new->track_group) {
+				log_message(LOG_INFO, "track_group %s is a duplicate", FMT_STR_VSLOT(strvec, i));
+				break;
+			}
+			if (!(new->track_group = find_track_group(strvec_slot(strvec, i))))
+                                log_message(LOG_INFO, "track_group %s not found", FMT_STR_VSLOT(strvec, i));
 		}
 #endif
 		else {
@@ -621,12 +805,16 @@ fwmark_err:
 		i++;
 	}
 
-	if (new->action == FR_ACT_GOTO &&
-	    new->mask & IPRULE_BIT_PRIORITY &&
-	    new->priority >= new->goto_target)
-	{
-		log_message(LOG_INFO, "Invalid rule - preference %u >= goto target %u", new->priority, new->goto_target);
-		goto err;
+	if (new->action == FR_ACT_GOTO) {
+		if (new->mask & IPRULE_BIT_PRIORITY) {
+			if (new->priority >= new->goto_target) {
+				log_message(LOG_INFO, "Invalid rule - preference %u >= goto target %u", new->priority, new->goto_target);
+				goto err;
+			}
+		} else {
+			log_message(LOG_INFO, "Invalid rule - goto target %u specified without preference", new->goto_target);
+			goto err;
+		}
 	}
 
 	if (new->action == FR_ACT_UNSPEC) {
@@ -646,10 +834,34 @@ fwmark_err:
 	}
 #endif
 
+#if HAVE_DECL_FRA_PROTOCOL
+	if (!new->dont_track) {
+		if ((new->mask & IPRULE_BIT_PROTOCOL) && new->protocol != RTPROT_KEEPALIVED)
+			log_message(LOG_INFO, "Rule cannot be tracked if protocol is not RTPROT_KEEPALIVED(%d), resetting protocol", RTPROT_KEEPALIVED);
+		new->protocol = RTPROT_KEEPALIVED;
+		new->mask |= IPRULE_BIT_PROTOCOL;
+	}
+#endif
+
+	if (new->track_group && !new->iif) {
+		log_message(LOG_INFO, "Static rule cannot have track_group if dev/iif not specified");
+		new->track_group = NULL;
+	}
+
+	new->family = (family == AF_UNSPEC) ? AF_INET : family;
+
+	if (!(new->mask & IPRULE_BIT_PRIORITY)) {
+		new->priority = new->family == AF_INET ? next_rule_priority_ipv4-- : next_rule_priority_ipv6--;
+		new->mask |= IPRULE_BIT_PRIORITY;
+		log_message(LOG_INFO, "Rule has no preference specifed - setting to %u. This is probably not what you want.", new->priority);
+	}
+
 	list_add(rule_list, new);
 	return;
 
 err:
+	FREE_PTR(new->to_addr);
+	FREE_PTR(new->from_addr);
 	FREE_PTR(new);
 }
 
@@ -703,4 +915,11 @@ void
 clear_diff_srules(void)
 {
 	clear_diff_rules(old_vrrp_data->static_rules, vrrp_data->static_rules);
+}
+
+void
+reset_next_rule_priority(void)
+{
+	next_rule_priority_ipv4 = RULE_START_PRIORITY;
+	next_rule_priority_ipv6 = RULE_START_PRIORITY;
 }

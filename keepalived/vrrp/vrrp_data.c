@@ -48,6 +48,7 @@
 #include "vrrp_snmp.h"
 #endif
 #include "vrrp_static_track.h"
+#include "parser.h"
 
 /* global vars */
 vrrp_data_t *vrrp_data = NULL;
@@ -122,7 +123,7 @@ dump_notify_script(FILE *fp, notify_script_t *script, char *type)
 		return;
 
 	conf_write(fp, "   %s state transition script = %s, uid:gid %d:%d", type,
-	       script->cmd_str, script->uid, script->gid);
+	       cmd_str(script), script->uid, script->gid);
 }
 
 static void
@@ -177,7 +178,6 @@ free_vscript(void *data)
 
 	free_list(&vscript->tracking_vrrp);
 	FREE(vscript->sname);
-	FREE_PTR(vscript->script.cmd_str);
 	FREE_PTR(vscript->script.args);
 	FREE(vscript);
 }
@@ -188,7 +188,7 @@ dump_vscript(FILE *fp, void *data)
 	const char *str;
 
 	conf_write(fp, " VRRP Script = %s", vscript->sname);
-	conf_write(fp, "   Command = %s", vscript->script.cmd_str);
+	conf_write(fp, "   Command = %s", cmd_str(&vscript->script));
 	conf_write(fp, "   Interval = %lu sec", vscript->interval / TIMER_HZ);
 	conf_write(fp, "   Timeout = %lu sec", vscript->timeout / TIMER_HZ);
 	conf_write(fp, "   Weight = %d", vscript->weight);
@@ -270,16 +270,13 @@ free_sock(void *sock_data)
 	sock_t *sock = sock_data;
 
 	/* First of all cancel pending thread */
-	thread_cancel(sock->thread_in);
+	thread_cancel(sock->thread);
 
 	/* Close related socket */
 	if (sock->fd_in > 0)
 		close(sock->fd_in);
-	if (sock->fd_out > 0) {
-		if (sock->thread_out)
-			thread_cancel(sock->thread_out);
+	if (sock->fd_out > 0)
 		close(sock->fd_out);
-	}
 	FREE(sock_data);
 }
 
@@ -321,6 +318,7 @@ free_vrrp(void *data)
 	free_notify_script(&vrrp->script_fault);
 	free_notify_script(&vrrp->script_stop);
 	free_notify_script(&vrrp->script);
+	free_notify_script(&vrrp->script_master_rx_lower_pri);
 	FREE_PTR(vrrp->stats);
 
 	free_list(&vrrp->track_ifp);
@@ -399,7 +397,7 @@ dump_vrrp(FILE *fp, void *data)
 		       vrrp->garp_delay/TIMER_HZ);
 	conf_write(fp, "   Gratuitous ARP repeat = %d", vrrp->garp_rep);
 	conf_write(fp, "   Gratuitous ARP refresh = %lu",
-		       vrrp->garp_refresh.tv_sec/TIMER_HZ);
+		       vrrp->garp_refresh.tv_sec);
 	conf_write(fp, "   Gratuitous ARP refresh repeat = %d", vrrp->garp_refresh_rep);
 	conf_write(fp, "   Gratuitous ARP lower priority delay = %u", vrrp->garp_lower_prio_delay / TIMER_HZ);
 	conf_write(fp, "   Gratuitous ARP lower priority repeat = %u", vrrp->garp_lower_prio_rep);
@@ -420,8 +418,8 @@ dump_vrrp(FILE *fp, void *data)
 	conf_write(fp, "   Accept = %s", vrrp->accept ? "enabled" : "disabled");
 	conf_write(fp, "   Preempt = %s", vrrp->nopreempt ? "disabled" : "enabled");
 	if (vrrp->preempt_delay)
-		conf_write(fp, "   Preempt delay = %ld secs",
-		       vrrp->preempt_delay / TIMER_HZ);
+		conf_write(fp, "   Preempt delay = %g secs",
+		       (float)vrrp->preempt_delay / TIMER_HZ);
 	conf_write(fp, "   Promote_secondaries = %s", vrrp->promote_secondaries ? "enabled" : "disabled");
 #if defined _WITH_VRRP_AUTH_
 	if (vrrp->auth_type) {
@@ -440,6 +438,9 @@ dump_vrrp(FILE *fp, void *data)
 #endif
 	if (vrrp->kernel_rx_buf_size)
 		conf_write(fp, "   Kernel rx buffer size = %lu", vrrp->kernel_rx_buf_size);
+
+	if (vrrp->debug)
+		conf_write(fp, "   Debug level = %d", vrrp->debug);
 
 	if (!LIST_ISEMPTY(vrrp->vip)) {
 		conf_write(fp, "   Virtual IP = %d", LIST_SIZE(vrrp->vip));
@@ -504,6 +505,8 @@ dump_vrrp(FILE *fp, void *data)
 		dump_notify_script(fp, vrrp->script_stop, "Stop");
 	if (vrrp->script)
 		dump_notify_script(fp, vrrp->script, "Generic");
+	if (vrrp->script_master_rx_lower_pri)
+		dump_notify_script(fp, vrrp->script_master_rx_lower_pri, "Master rx lower pri");
 }
 
 void
@@ -614,16 +617,14 @@ alloc_vrrp_unicast_peer(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
 	struct sockaddr_storage *peer = NULL;
-	int ret;
 
 	if (!LIST_EXISTS(vrrp->unicast_peer))
 		vrrp->unicast_peer = alloc_list(free_unicast_peer, dump_unicast_peer);
 
 	/* Allocate new unicast peer */
 	peer = (struct sockaddr_storage *) MALLOC(sizeof(struct sockaddr_storage));
-	ret = inet_stosockaddr(strvec_slot(strvec, 0), 0, peer);
-	if (ret < 0) {
-		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] malformed unicast"
+	if (inet_stosockaddr(strvec_slot(strvec, 0), NULL, peer)) {
+		report_config_error(CONFIG_GENERAL_ERROR, "Configuration error: VRRP instance[%s] malformed unicast"
 				     " peer address[%s]. Skipping..."
 				   , vrrp->iname, FMT_STR_VSLOT(strvec, 0));
 		FREE(peer);
@@ -633,7 +634,7 @@ alloc_vrrp_unicast_peer(vector_t *strvec)
 	if (!vrrp->family)
 		vrrp->family = peer->ss_family;
 	else if (peer->ss_family != vrrp->family) {
-		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] and unicast peer address"
+		report_config_error(CONFIG_GENERAL_ERROR, "Configuration error: VRRP instance[%s] and unicast peer address"
 				     "[%s] MUST be of the same family !!! Skipping..."
 				   , vrrp->iname, FMT_STR_VSLOT(strvec, 0));
 		FREE(peer);
@@ -747,7 +748,7 @@ alloc_vrrp_vip(vector_t *strvec)
 		if (vrrp->family == AF_UNSPEC)
 			vrrp->family = address_family;
 		else if (address_family != vrrp->family) {
-			log_message(LOG_INFO, "(%s): address family must match VRRP instance [%s] - ignoring", vrrp->iname, FMT_STR_VSLOT(strvec, 0));
+			report_config_error(CONFIG_GENERAL_ERROR, "(%s): address family must match VRRP instance [%s] - ignoring", vrrp->iname, FMT_STR_VSLOT(strvec, 0));
 			free_list_element(vrrp->vip, vrrp->vip->tail);
 		}
 	}

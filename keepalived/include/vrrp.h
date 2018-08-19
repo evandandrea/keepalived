@@ -278,6 +278,7 @@ typedef struct _vrrp_t {
 	notify_script_t		*script_master;
 	notify_script_t		*script_fault;
 	notify_script_t		*script_stop;
+	notify_script_t		*script_master_rx_lower_pri;
 	notify_script_t		*script;
 
 	/* rfc2338.6.2 */
@@ -315,6 +316,7 @@ typedef struct _vrrp_t {
 #define VRRP_STATE_FAULT		3	/* internal */
 #define VRRP_STATE_STOP			98	/* internal */
 #define VRRP_DISPATCHER			99	/* internal */
+#define VRRP_EVENT_MASTER_RX_LOWER_PRI	1000	/* Dummy state for sending event notify */
 
 /* VRRP packet handling */
 #define VRRP_PACKET_OK       0
@@ -327,12 +329,6 @@ typedef struct _vrrp_t {
 #define VRRP_AUTH_LEN		8
 #define VRRP_VIP_TYPE		(1 << 0)
 #define VRRP_EVIP_TYPE		(1 << 1)
-
-/* VRRP macro */
-#define VRRP_IS_BAD_VERSION(id)		((id) < 2 || (id) > 3)
-#define VRRP_IS_BAD_VID(id)		((id) < 1 || (id) > 255)	/* rfc2338.6.1.vrid */
-#define VRRP_IS_BAD_PRIORITY(p)		((p) < 1 || (p) > VRRP_PRIO_OWNER)	/* rfc2338.6.1.prio */
-#define VRRP_IS_BAD_DEBUG_INT(d)	((d) < 0 || (d) > 4)
 
 /* We have to do some reduction of the calculation for VRRPv3 in order not to overflow a uint32; 625 / 16 == TIMER_CENTI_HZ / 256 */
 #define VRRP_TIMER_SKEW(svr)	((svr)->version == VRRP_VERSION_3 ? (((256U-(svr)->effective_priority) * ((svr)->master_adver_int / TIMER_CENTI_HZ) * 625U) / 16U) : ((256U-(svr)->effective_priority) * TIMER_HZ/256U))
@@ -358,7 +354,7 @@ extern bool have_ipv6_instance;
 extern void clear_summary_flags(void);
 extern size_t vrrp_adv_len(vrrp_t *);
 extern vrrphdr_t *vrrp_get_header(sa_family_t, char *, unsigned *);
-extern int open_vrrp_send_socket(sa_family_t, int, interface_t *, bool, int);
+extern int open_vrrp_send_socket(sa_family_t, int, interface_t *, bool);
 extern int open_vrrp_read_socket(sa_family_t, int, interface_t *, bool, int);
 extern int new_vrrp_socket(vrrp_t *);
 extern void vrrp_send_adv(vrrp_t *, uint8_t);

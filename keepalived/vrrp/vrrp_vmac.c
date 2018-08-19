@@ -162,7 +162,6 @@ netlink_link_up(vrrp_t *vrrp)
 	struct {
 		struct nlmsghdr n;
 		struct ifinfomsg ifi;
-		char buf[256];
 	} req;
 
 	memset(&req, 0, sizeof (req));
@@ -291,13 +290,6 @@ netlink_link_add_vmac(vrrp_t *vrrp)
 		kernel_netlink_poll();
 	}
 
-//	if (ifp->base_ifp == ifp) {
-//		ifp->base_ifp = vrrp->ifp;
-//		vrrp->ifp = ifp;
-//log_message(LOG_INFO, "Setting base_ifp for %s to %s", ifp->ifname, ifp->base_ifp->ifname);
-//	}
-//else
-//log_message(LOG_INFO, "Already set base_ifp for %s to %s", ifp->ifname, ifp->base_ifp->ifname);
 	ifp->vmac = true;
 
 	if (!ifp->ifindex)
@@ -350,7 +342,8 @@ netlink_link_add_vmac(vrrp_t *vrrp)
 			log_message(LOG_INFO, "vmac: Error setting ADDR_GEN_MODE to NONE");
 #endif
 
-		if (vrrp->family == AF_INET6) {
+		if (vrrp->family == AF_INET6 &&
+		    !__test_bit(VRRP_VMAC_XMITBASE_BIT, &vrrp->vmac_flags)) {
 			/* Add link-local address. If a source address has been specified, use it,
 			 * else use link-local address from underlying interface to vmac if there is one,
 			 * otherwise construct a link-local address based on underlying interface's

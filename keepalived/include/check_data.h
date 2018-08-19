@@ -200,7 +200,7 @@ typedef struct _check_data {
 #define VS_SCRIPT_ISEQ(XS,YS) \
 	(!(XS) == !(YS) && \
 	 (!(XS) || \
-	  (!strcmp((XS)->cmd_str, (YS)->cmd_str) && \
+	  (!notify_script_compare((XS), (YS)) && \
 	   (XS)->uid == (YS)->uid && \
 	   (XS)->gid == (YS)->gid)))
 
@@ -227,6 +227,13 @@ typedef struct _check_data {
 			 (X)->forwarding_method       == (Y)->forwarding_method		&& \
 			 !(X)->virtualhost	      == !(Y)->virtualhost		&& \
 			 (!(X)->virtualhost || !strcmp((X)->virtualhost, (Y)->virtualhost)))
+
+#ifndef IP_VS_SVC_F_SCHED_MH_PORT
+#define IP_VS_SVC_F_SCHED_MH_PORT IP_VS_SVC_F_SCHED_SH_PORT
+#endif
+#ifndef IP_VS_SVC_F_SCHED_MH_FALLBACK
+#define IP_VS_SVC_F_SCHED_MH_FALLBACK IP_VS_SVC_F_SCHED_SH_FALLBACK
+#endif
 
 /* Global vars exported */
 extern check_data_t *check_data;

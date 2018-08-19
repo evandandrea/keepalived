@@ -85,7 +85,7 @@ open_log_file(const char *name, const char *prog, const char *namespace, const c
 	if (namespace)
 		len += strlen(namespace) + 1;
 	if (instance)
-		len += strlen(instance);
+		len += strlen(instance) + 1;
 
 	file_name = MALLOC(len + 1);
 	dir_end = strrchr(name, '/');
@@ -124,11 +124,26 @@ flush_log_file(void)
 void
 vlog_message(const int facility, const char* format, va_list args)
 {
+#if !HAVE_VSYSLOG
 	char buf[MAX_LOG_MSG+1];
 
 	vsnprintf(buf, sizeof(buf), format, args);
+#endif
+
+	/* Don't write syslog if testing configuration */
+	if (__test_bit(CONFIG_TEST_BIT, &debug))
+		return;
 
 	if (log_file || (__test_bit(DONT_FORK_BIT, &debug) && log_console)) {
+#if HAVE_VSYSLOG
+		va_list args1;
+		char buf[2 * MAX_LOG_MSG + 1];
+
+		va_copy(args1, args);
+		vsnprintf(buf, sizeof(buf), format, args1);
+		va_end(args1);
+#endif
+
 		/* timestamp setup */
 		time_t t = time(NULL);
 		struct tm tm;
@@ -146,7 +161,11 @@ vlog_message(const int facility, const char* format, va_list args)
 	}
 
 	if (!__test_bit(NO_SYSLOG_BIT, &debug))
+#if HAVE_VSYSLOG
+		vsyslog(facility, format, args);
+#else
 		syslog(facility, "%s", buf);
+#endif
 }
 
 void

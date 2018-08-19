@@ -412,48 +412,6 @@ vrrp_timer_timeout(const int fd)
 }
 #endif
 
-/* We shouldn't receive anything on the send socket since IP_MULTICAST_ALL is cleared,
- * and no multicast groups are subscribed to on the socket. However, Debian Jessie
- * with a 3.16.0 kernel, CentOS 7 with a 3.10.0 kernel, and Fedora 16 with a
- * 3.6.11 kernel all exhibit the problem of multicast packets being queued on the
- * send socket. Whether this is a kernel problem that has been subsequently resolved,
- * or a system default configuration problem isn't yet known.
- *
- * The workaround to the problem is to read on the send sockets, and to discard any
- * received data.
- *
- * If anyone can provide more information about this issue it would be very helpful.
- */
-static int
-vrrp_write_fd_read_thread(thread_t *thread)
-{
-	sock_t *sock;
-	struct sockaddr_storage src_addr;
-	socklen_t src_addr_len = sizeof(src_addr);
-	ssize_t len;
-	static bool problem_reported = false;
-
-	sock = THREAD_ARG(thread);
-
-	if (thread->type == THREAD_READ_TIMEOUT || sock->fd_out == -1) {
-		/* This shouldn't happen */
-		log_message(LOG_INFO, "VRRP send socket %d, thread_type %d", sock->fd_out, thread->type);
-	} else {
-		len = recvfrom(sock->fd_out, vrrp_buffer, vrrp_buffer_len, MSG_DONTWAIT, (struct sockaddr *)&src_addr, &src_addr_len);
-		if (len == -1)
-			log_message(LOG_INFO, "Read on vrrp send socket %d failed - errno %d (%m)", sock->fd_out, errno);
-		else if (!problem_reported) {
-			log_message(LOG_INFO, "Kernel/system configuration issue causing multicast packets to be received but IP_MULTICAST_ALL unset");
-			problem_reported = true;
-		}
-	}
-
-	if (sock->fd_out != -1)
-		sock->thread_out = thread_add_read(thread->master, vrrp_write_fd_read_thread, sock, sock->fd_out, TIMER_NEVER);
-
-	return 0;
-}
-
 /* Thread functions */
 static void
 vrrp_register_workers(list l)
@@ -483,7 +441,7 @@ vrrp_register_workers(list l)
 	if (!LIST_ISEMPTY(vrrp_data->vrrp)) {
 		/* Init BFD tracking thread */
 		bfd_thread = thread_add_read(master, vrrp_bfd_thread, NULL,
-					     bfd_vrrp_event_pipe[0], TIMER_HZ);
+					     bfd_vrrp_event_pipe[0], TIMER_NEVER);
 	}
 #endif
 
@@ -495,18 +453,15 @@ vrrp_register_workers(list l)
 
 		/* Register a timer thread if interface exists */
 		if (sock->fd_in != -1)
-			sock->thread_in = thread_add_read(master, vrrp_read_dispatcher_thread,
+			sock->thread = thread_add_read(master, vrrp_read_dispatcher_thread,
 						       sock, sock->fd_in, vrrp_timer);
-		if (sock->fd_out != -1 && !(global_data->vrrp_rx_bufs_policy & RX_BUFS_NO_SEND_RX))
-			sock->thread_out = thread_add_read(master, vrrp_write_fd_read_thread,
-						       sock, sock->fd_out, TIMER_NEVER);
 	}
 }
 
 void
 vrrp_thread_add_read(vrrp_t *vrrp)
 {
-	vrrp->sockets->thread_in = thread_add_read(master, vrrp_read_dispatcher_thread,
+	vrrp->sockets->thread = thread_add_read(master, vrrp_read_dispatcher_thread,
 						vrrp->sockets, vrrp->sockets->fd_in, vrrp_timer_fd(vrrp->sockets->fd_in));
 }
 
@@ -602,7 +557,7 @@ vrrp_open_sockpool(list l)
 			sock->fd_out = -1;
 		else
 			sock->fd_out = open_vrrp_send_socket(sock->family, sock->proto,
-							     ifp, sock->unicast, sock->rx_buf_size);
+							     ifp, sock->unicast);
 	}
 }
 
@@ -862,7 +817,7 @@ vrrp_bfd_thread(thread_t * thread)
 	bfd_event_t evt;
 
 	bfd_thread = thread_add_read(master, vrrp_bfd_thread, NULL,
-				     thread->u.fd, TIMER_HZ * 60);
+				     thread->u.fd, TIMER_NEVER);
 
 	if (thread->type != THREAD_READY_FD)
 		return 0;
@@ -998,7 +953,7 @@ vrrp_read_dispatcher_thread(thread_t * thread)
 	/* register next dispatcher thread */
 	vrrp_timer = vrrp_timer_fd(fd);
 	if (fd != -1)
-		sock->thread_in = thread_add_read(thread->master, vrrp_read_dispatcher_thread,
+		sock->thread = thread_add_read(thread->master, vrrp_read_dispatcher_thread,
 					       sock, fd, vrrp_timer);
 
 	return 0;
@@ -1066,8 +1021,10 @@ vrrp_script_child_thread(thread_t * thread)
 		if (timeout) {
 			/* If kill returns an error, we can't kill the process since either the process has terminated,
 			 * or we don't have permission. If we can't kill it, there is no point trying again. */
-			if (!kill(-pid, sig_num))
+			if (!kill(-pid, sig_num)) {
+				log_message(LOG_INFO, "kill -%d of process %s(%d) with new state %d failed with errno %d", sig_num, vscript->script.args[0], pid, vscript->state, errno);
 				timeout = 1000;
+			}
 		} else if (vscript->state != SCRIPT_STATE_IDLE) {
 			log_message(LOG_INFO, "Child thread pid %d timeout with unknown script state %d", pid, vscript->state);
 			timeout = 10;	/* We need some timeout */

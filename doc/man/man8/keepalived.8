@@ -1,4 +1,4 @@
-.TH KEEPALIVED "8" "April 2016"
+.TH KEEPALIVED "8" "July 2018"
 
 .na
 .nh
@@ -11,6 +11,8 @@ keepalived \- load\-balancing and high\-availability service
 [\fB\-f\fP|\fB\-\-use\-file\fP=FILE]
 [\fB\-P\fP|\fB\-\-vrrp\fP]
 [\fB\-C\fP|\fB\-\-check\fP]
+[\fB\-B\fP|\fB\-\-no_bfd\fP]
+[\fB\-\-all\fP]
 [\fB\-l\fP|\fB\-\-log\-console\fP]
 [\fB\-D\fP|\fB\-\-log\-detail\fP]
 [\fB\-S\fP|\fB\-\-log\-facility\fP={0-7}]
@@ -27,6 +29,7 @@ keepalived \- load\-balancing and high\-availability service
 [\fB\-r\fP|\fB\-\-vrrp_pid\fP=FILE]
 [\fB\-c\fP|\fB\-\-checkers_pid\fP=FILE]
 [\fB\-a\fP|\fB\-\-address-monitoring\fP]
+[\fB\-b\fP|\fB\-\-bfd_pid\fP=FILE]
 [\fB\-s\fP|\fB\-\-namespace\fP=NAME]
 [\fB\-i\fP|\fB\-\-config-id\fP id]
 [\fB\-x\fP|\fB\-\-snmp\fP]
@@ -61,6 +64,12 @@ not use the IPVS load balancer.
 \fB -C, --check\fP
 Only run the healthcheck subsystem. This is useful for configurations
 that use the IPVS load balancer with a single director with no failover.
+.TP
+\fB -B, --no_bfd\fP
+Don't run the BFD subsystem.
+.TP
+\fB --all\fP
+Run all subsystems, even if they have no configuration.
 .TP
 \fB -l, --log-console\fP
 Log messages to the local console. The default behavior is to log
@@ -127,6 +136,11 @@ a network namespace is being used.
 \fB -a, --address-monitoring\fP
 Log all address additions/deletions reported by netlink.
 .TP
+\fB -b, --bfd_pid\fP=FILE
+Use the specified pidfile for the BFD child process. The default pidfile
+for the BFD child process is "/var/run/keepalived_bfd.pid" unless
+a network namespace is being used.
+.TP
 \fB -s, --namespace\fP=NAME
 Run keepalived in network namespace NAME. See
 .B NAMESPACES
@@ -168,19 +182,39 @@ kill -s $(keepalived --signum=STOP) $(cat /var/run/keepalived.pid)
 .fi
 .TP
 \fB -t, --config-test\fP[=FILE]
-Keepalived file check the configuration file and exit with exit status 1
-if it would not run with the config, otherwise it exits with exit status 0.
-Rather that writing to syslog, it will write to the files specified by
-FILE (default /tmp/keepalived.config-check) (_bfd, _check and _vrrp will 
-be inserted into the filename before the final ., or at the end if no .,
-for the output ofthe child processes).
+Keepalived will check the configuration file and exit with non-zero exit
+status if there are errors in the configuration, otherwise it exits with
+exit status 0 (see \fBExit status\fP below for details).
+
+Rather that writing to syslog, it will write diagnostic messages to stderr
+unless file is specified, in which case it will write to the file.
 .TP
 \fB -v, --version\fP
 Display the version and exit.
 .TP
 \fB -h, --help\fP
 Display this help message and exit.
-
+.SS "Exit status:"
+.TP
+0
+if OK
+.TP
+1
+if unable to malloc memory
+.TP
+2
+if cannot initialise subsystems
+.TP
+3
+if running with --config-test and configuration cannot be run
+.TP
+4
+if running with --config-test and there are configuration errors but keepalived
+will run after modifying the configuration
+.TP
+5
+if running with --config-test and script security hasn't been enabled but scripts
+are configured.
 .SH NAMESPACES
 .B keepalived
 can be run in a network namespace (see
@@ -244,7 +278,7 @@ Write statistics info to
 .LP
 .TP
 .B SIGFUNC=JSON
-Write configuration data is JSON format to
+Write configuration data in JSON format to
 .B /tmp/keepalived.json
 .LP
 

@@ -81,7 +81,7 @@ const hash_t hashes[hash_guard] = {
 #define HASH_INIT(sock)		((sock)->hash->init(&(sock)->context))
 #define HASH_UPDATE(sock, buf, len) \
 	if ((sock)->content_len == -1 || (sock)->rx_bytes < (sock)->content_len) \
-		((sock)->hash->update(&(sock)->context, (buf), (sock)->content_len == -1 || (unsigned int)((sock)->content_len - (sock)->rx_bytes >= len ? len : (sock)->content_len - (sock)->rx_bytes)))
+		((sock)->hash->update(&(sock)->context, (buf), (sock)->content_len == -1 || (unsigned int)(sock)->content_len - (sock)->rx_bytes >= len ? len : (sock)->content_len - (sock)->rx_bytes))
 #define HASH_FINAL(sock, digest) \
 	((sock)->hash->final((digest), &(sock)->context))
 
@@ -172,7 +172,7 @@ find_content_len(char *buffer, size_t size)
 		content_len = strtoul(p, &end, 10);
 
 		/* Make sure we have read to the end of the line */
-		if (!*end || *end == '\r' || *end != '\n')
+		if (!*end || *end == '\r' || *end == '\n')
 			valid_len = true;
 	}
 	buffer[size] = sav_char;

@@ -64,6 +64,8 @@ bool snmp_running;		/* True if this process is running SNMP */
 
 /* local variables */
 static bool shutting_down;
+static int sav_argc;
+static char **sav_argv;
 
 #ifdef _WITH_LVS_
 #include "../keepalived/include/check_daemon.h"
@@ -205,6 +207,13 @@ destroy_child_finder(void)
 	set_child_finder(NULL, NULL, NULL, NULL, NULL, 0);
 }
 
+void
+save_cmd_line_options(int argc, char **argv)
+{
+	sav_argc = argc;
+	sav_argv = argv;
+}
+
 #ifndef _DEBUG_
 static const char *
 get_end(const char *str, size_t max_len)
@@ -227,7 +236,7 @@ get_end(const char *str, size_t max_len)
 }
 
 static void
-log_options(const char *option, const char *option_str)
+log_options(const char *option, const char *option_str, unsigned indent)
 {
 	const char *p = option_str;
 	size_t opt_len = strlen(option);
@@ -235,17 +244,43 @@ log_options(const char *option, const char *option_str)
 	bool first_line = true;
 
 	while (*p) {
+		/* Skip leading spaces */
+		while (*p == ' ')
+			p++;
+
 		end = get_end(p, 100 - opt_len);
 		if (first_line) {
-			log_message(LOG_INFO, "  %s: %.*s", option, (int)(end - p), p);
+			log_message(LOG_INFO, "%*s%s: %.*s", indent, "", option, (int)(end - p), p);
 			first_line = false;
 		}
 		else
-			log_message(LOG_INFO, "%*s%.*s", (int)(3 + strlen(option) + 2), "", (int)(end - p), p);
+			log_message(LOG_INFO, "%*s%.*s", (int)(indent + opt_len + 2), "", (int)(end - p), p);
 		p = end;
-		while (*p == ' ')
-			p++;
 	}
+}
+
+void
+log_command_line(unsigned indent)
+{
+	size_t len = 0;
+	char *log_str;
+	char *p;
+	int i;
+
+	if (!sav_argv)
+		return;
+
+	for (i = 0; i < sav_argc; i++)
+		len += strlen(sav_argv[i]) + 3;	/* Add opening and closing 's, and following space or '\0' */
+
+	log_str = MALLOC(len);
+
+	for (i = 0, p = log_str; i < sav_argc; i++)
+		p += sprintf(p, "%s'%s'", i ? " " : "", sav_argv[i]);
+
+	log_options("Command line", log_str, indent);
+
+	FREE(log_str);
 }
 
 /* report_child_status returns true if the exit is a hard error, so unable to continue */
@@ -303,9 +338,13 @@ report_child_status(int status, pid_t pid, char const *prog_name)
 						(LINUX_VERSION_CODE      ) & 0xff);
 			uname(&uname_buf);
 			log_message(LOG_INFO, "  Running on %s %s %s", uname_buf.sysname, uname_buf.release, uname_buf.version);
-			log_options("configure options", KEEPALIVED_CONFIGURE_OPTIONS);
-			log_options("Config options", CONFIGURATION_OPTIONS);
-			log_options("System options", SYSTEM_OPTIONS);
+			log_command_line(2);
+			log_options("configure options", KEEPALIVED_CONFIGURE_OPTIONS, 2);
+			log_options("Config options", CONFIGURATION_OPTIONS, 2);
+			log_options("System options", SYSTEM_OPTIONS, 2);
+
+//			if (__test_bit(DONT_RESPAWN_BIT, &debug))
+//				segv_termination = true;
 		}
 		else
 			log_message(LOG_INFO, "%s exited due to signal %d", prog_id, WTERMSIG(status));
@@ -843,10 +882,6 @@ thread_cancel_read(thread_master_t *m, int fd)
 		thread = t->next;
 
 		if (t->u.fd == fd) {
-			if (!FD_ISSET(fd, &m->readfd))
-				log_message(LOG_WARNING, "Read fd not set [%d]", fd);
-			else
-				FD_CLR(fd, &m->readfd);
 			thread_cancel(t);
 			return;
 		}
@@ -924,7 +959,9 @@ thread_compute_timer(thread_master_t * m, timeval_t * timer_wait)
 static thread_list_t *
 thread_fetch_next_queue(thread_master_t *m)
 {
-	int num_fds, old_errno;
+	int num_fds;
+	int sav_errno;
+	int last_select_errno = 0;
 	thread_t *thread;
 	thread_t *t;
 	fd_set readfd;
@@ -991,7 +1028,7 @@ retry:	/* When thread can't fetch try to find next thread again. */
 
 #ifdef _SELECT_DEBUG_
 	if (prog_type == PROG_TYPE_VRRP)
-		log_message(LOG_INFO, "select with timer %lu.%6.6ld, fdsetsize %d, readfds 0x%lx, writefds 0x%lx", timer_wait.tv_sec, timer_wait.tv_usec, fdsetsize, readfd.fds_bits[0], writefd.fds_bits[0]);
+		log_message(LOG_INFO, "select with timer %lu.%6.6ld, fdsetsize %d, readfds 0x%lx", timer_wait.tv_sec, timer_wait.tv_usec, fdsetsize, readfd.fds_bits[0]);
 #endif
 
 	/* Don't call select() if timer_wait is 0 */
@@ -1002,19 +1039,30 @@ retry:	/* When thread can't fetch try to find next thread again. */
 		num_fds = select(fdsetsize, &readfd, &writefd, NULL, &timer_wait);
 
 	/* we have to save errno here because the next syscalls will set it */
-	old_errno = errno;
+	sav_errno = errno;
 
 #ifdef _SELECT_DEBUG_
 	if (prog_type == PROG_TYPE_VRRP)
-		log_message(LOG_INFO, "Select returned %d, errno %d, readfd 0x%lx, writefd 0x%lx, timer %lu.%6.6ld", num_fds, old_errno, readfd.fds_bits[0], writefd.fds_bits[0], timer_wait.tv_sec, timer_wait.tv_usec);
+		log_message(LOG_INFO, "Select returned %d, errno %d, readfd 0x%lx, writefd 0x%lx, timer %lu.%6.6ld", num_fds, sav_errno, readfd.fds_bits[0], writefd.fds_bits[0], timer_wait.tv_sec, timer_wait.tv_usec);
 #endif
 
 	if (num_fds < 0) {
-		if (old_errno == EINTR)
+		if (sav_errno == EINTR)
 			goto retry;
+
 		/* Real error. */
-		DBG("select error: %s", strerror(old_errno));
+		if (sav_errno != last_select_errno) {
+			/* Log the error first time only */
+			log_message(LOG_INFO, "select error: %s", strerror(sav_errno));
+			last_select_errno = sav_errno;
+		}
 		assert(0);
+
+		/* Make sure we don't sit it a tight loop */
+		if (sav_errno == EINVAL || sav_errno == ENOMEM)
+			sleep(1);
+
+		goto retry;
 	}
 
 	timer_expired = (num_fds == 0 || !timerisset(&timer_wait));
@@ -1028,7 +1076,10 @@ retry:	/* When thread can't fetch try to find next thread again. */
 		if (num_fds > 0)
 			snmp_read(&readfd);
 		else if (timer_expired && is_snmp_timer)
+		{
 			snmp_timeout();
+			run_alarms();
+		}
 	}
 #endif
 
@@ -1116,8 +1167,8 @@ retry:	/* When thread can't fetch try to find next thread again. */
 	}
 
 #ifdef _WITH_SNMP_
-	run_alarms();
-	netsnmp_check_outstanding_agent_requests();
+	if (snmp_running)
+		netsnmp_check_outstanding_agent_requests();
 #endif
 
 	/* There is no ready thread. */
@@ -1210,15 +1261,11 @@ process_child_termination(pid_t pid, int status)
 	if (child_remover)
 		child_remover(thread);
 
-	if (permanent_vrrp_checker_error || __test_bit(CONFIG_TEST_BIT, &debug))
+	if (permanent_vrrp_checker_error)
 	{
-		/* The child had a permanant error, or we were just testing the config,
-		 * so no point in respawning */
+		/* The child had a permanant error, so no point in respawning */
 		thread->type = THREAD_UNUSED;
 		thread_list_add(&m->unuse, thread);
-
-		if (!__test_bit(CONFIG_TEST_BIT, &debug))
-			raise(SIGTERM);
 	}
 	else
 		thread_list_add(&m->ready, thread);

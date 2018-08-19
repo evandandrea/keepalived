@@ -47,6 +47,7 @@
 #include <linux/ethtool.h>
 #include <net/if_arp.h>
 #include <time.h>
+#include <linux/filter.h>
 
 /* local include */
 #include "global_data.h"
@@ -368,24 +369,32 @@ dump_garp_delay(FILE *fp, void *data)
 {
 	garp_delay_t *gd = data;
 	char time_str[26];
+	interface_t *ifp;
+	element e;
 
 	conf_write(fp, "------< GARP delay group %d >------", gd->aggregation_group);
 
 	if (gd->have_garp_interval) {
-		conf_write(fp, " GARP interval = %ld.%6.6ld", gd->garp_interval.tv_sec, gd->garp_interval.tv_usec);
+		conf_write(fp, " GARP interval = %g", gd->garp_interval.tv_sec + ((double)gd->garp_interval.tv_usec) / 1000000);
 		if (!ctime_r(&gd->garp_next_time.tv_sec, time_str))
                         strcpy(time_str, "invalid time ");
 		conf_write(fp, " GARP next time %ld.%6.6ld (%.19s.%6.6ld)", gd->garp_next_time.tv_sec, gd->garp_next_time.tv_usec, time_str, gd->garp_next_time.tv_usec);
 	}
 
 	if (gd->have_gna_interval) {
-		conf_write(fp, " GNA interval = %ld.%6.6ld", gd->gna_interval.tv_sec, gd->gna_interval.tv_usec);
+		conf_write(fp, " GNA interval = %g", gd->gna_interval.tv_sec + ((double)gd->gna_interval.tv_usec) / 1000000);
 		if (!ctime_r(&gd->gna_next_time.tv_sec, time_str))
                         strcpy(time_str, "invalid time ");
 		conf_write(fp, " GNA next time %ld.%6.6ld (%.19s.%6.6ld)", gd->gna_next_time.tv_sec, gd->gna_next_time.tv_usec, time_str, gd->gna_next_time.tv_usec);
 	}
 	else if (!gd->have_garp_interval)
 		conf_write(fp, " No configuration");
+
+	conf_write(fp, " Interfaces");
+	LIST_FOREACH(if_queue, ifp, e) {
+		if (ifp->garp_delay == gd)
+			conf_write(fp, "  %s", ifp->ifname);
+	}
 }
 
 void
@@ -404,6 +413,7 @@ set_default_garp_delay(void)
 	element e;
 	interface_t *ifp;
 	garp_delay_t *delay;
+	vrrp_t *vrrp;
 
 	if (global_data->vrrp_garp_interval) {
 		default_delay.garp_interval.tv_sec = global_data->vrrp_garp_interval / 1000000;
@@ -416,15 +426,11 @@ set_default_garp_delay(void)
 		default_delay.have_gna_interval = true;
 	}
 
-	/* Allocate a delay structure to each physical interface that doesn't have one */
-	for (e = LIST_HEAD(if_queue); e; ELEMENT_NEXT(e)) {
-		ifp = ELEMENT_DATA(e);
-		if (!ifp->garp_delay
-#ifdef _HAVE_VRRP_VMAC_
-				     && !ifp->vmac
-#endif
-						  )
-		{
+	/* Allocate a delay structure to each physical interface that doesn't have one and
+	 * is being used by a VRRP instance */
+	LIST_FOREACH(vrrp_data->vrrp, vrrp, e) {
+		ifp = IF_BASE_IFP(vrrp->ifp);
+		if (!ifp->garp_delay) {
 			alloc_garp_delay();
 			delay = LIST_TAIL_DATA(garp_delay);
 			*delay = default_delay;
@@ -686,7 +692,7 @@ if_join_vrrp_group(sa_family_t family, int *sd, interface_t *ifp)
 
 	if (ret < 0) {
 		log_message(LOG_INFO, "(%s) cant do IP%s_ADD_MEMBERSHIP errno=%s (%d)",
-			    ifp->ifname, (family == AF_INET) ? "" : "V6", strerror(errno), errno);
+			    ifp->ifname, (family == AF_INET) ? "" : "v6", strerror(errno), errno);
 		close(*sd);
 		*sd = -1;
 	}
@@ -796,8 +802,8 @@ if_setsockopt_ipv6_checksum(int *sd)
 	return *sd;
 }
 
-int
 #if HAVE_DECL_IP_MULTICAST_ALL	/* Since Linux 2.6.31 */
+int
 if_setsockopt_mcast_all(sa_family_t family, int *sd)
 {
 	int ret;
@@ -820,14 +826,8 @@ if_setsockopt_mcast_all(sa_family_t family, int *sd)
 	}
 
 	return *sd;
-#else
-if_setsockopt_mcast_all(__attribute__((unused)) sa_family_t family, __attribute__((unused)) int *sd)
-{
-	/* It seems reasonable to just skip the calls to if_setsockopt_mcast_all
-	 * if there is no support for that feature in header files */
-	return -1;
-#endif
 }
+#endif
 
 int
 if_setsockopt_mcast_loop(sa_family_t family, int *sd)
@@ -958,6 +958,28 @@ if_setsockopt_rcvbuf(int *sd, int val)
 	return *sd;
 }
 
+int
+if_setsockopt_no_receive(int *sd)
+{
+	int ret;
+	struct sock_filter bpfcode[1] = {
+		{0x06, 0, 0, 0},	/* ret #0 - means that all packets will be filtered out */
+	};
+	struct sock_fprog bpf = {1, bpfcode};
+
+	if (*sd < 0)
+		return -1;
+
+	ret = setsockopt(*sd, SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf));
+	if (ret < 0) {
+		log_message(LOG_INFO, "Can't set SO_ATTACH_FILTER option. errno=%d (%m)", errno);
+		close(*sd);
+		*sd = -1;
+	}
+
+	return *sd;
+}
+
 #ifdef _TIMER_DEBUG_
 void
 print_vrrp_if_addresses(void)
@@ -1050,16 +1072,11 @@ cleanup_lost_interface(interface_t *ifp)
 		/* Find the sockpool entry. If none, then we have closed the socket */
 		if (vrrp->sockets->fd_in != -1) {
 			remove_vrrp_fd_bucket(vrrp->sockets->fd_in);
-			thread_cancel(vrrp->sockets->thread_in);
-			vrrp->sockets->thread_in = NULL;
+			thread_cancel_read(master, vrrp->sockets->fd_in);
 			close(vrrp->sockets->fd_in);
 			vrrp->sockets->fd_in = -1;
 		}
 		if (vrrp->sockets->fd_out != -1) {
-			if (vrrp->sockets->thread_out) {
-				thread_cancel(vrrp->sockets->thread_out);
-				vrrp->sockets->thread_out = NULL;
-			}
 			close(vrrp->sockets->fd_out);
 			vrrp->sockets->fd_out = -1;
 		}
@@ -1102,7 +1119,7 @@ setup_interface(vrrp_t *vrrp)
 			vrrp->sockets->fd_out = -1;
 		else
 			vrrp->sockets->fd_out = open_vrrp_send_socket(vrrp->sockets->family, vrrp->sockets->proto,
-							ifp, vrrp->sockets->unicast, vrrp->sockets->rx_buf_size);
+							ifp, vrrp->sockets->unicast);
 
 		if (vrrp->sockets->fd_out > master->max_fd)
 			master->max_fd = vrrp->sockets->fd_out;

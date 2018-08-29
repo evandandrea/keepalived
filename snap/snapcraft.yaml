@@ -1,4 +1,4 @@
-name: keepalived
+name: keepalived-ev
 version: 'v2.0+git'
 summary: High availability VRRP and load-balancing for Linux
 description: |

@@ -13,5 +13,5 @@ before_script:
   - sudo snap install snapcraft --channel edge/bases --classic
 
 script:
-  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu snapcraft version
-  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu snapcraft
+  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft version
+  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft

@@ -10,10 +10,9 @@ addons:
 
 before_script:
   - sudo modprobe kvm
-  - sudo apt-get install -y cloud-image-utils qemu-kvm snapd cpu-checker
+  - sudo apt-get install -y cloud-image-utils qemu-system-x86 qemu-utils snapd
   - sudo snap install snapcraft --channel edge/bases --classic
 
 script:
-  - sudo kvm-ok
   - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft version
   - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft --debug

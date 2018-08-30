@@ -3,6 +3,8 @@ git:
 
 dist: trusty
 sudo: required
+services:
+  - docker
 
 addons:
   apt:

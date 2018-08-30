@@ -1,16 +1,15 @@
 git:
   depth: 1
 
-dist: trusty
-sudo: required
-services:
-  - docker
+language: shell
+dist: xenial
 
 addons:
   apt:
     update: true
 
 before_script:
+  - sudo modprobe kvm
   - sudo apt-get install -y cloud-image-utils qemu-kvm snapd cpu-checker
   - sudo snap install snapcraft --channel edge/bases --classic
 

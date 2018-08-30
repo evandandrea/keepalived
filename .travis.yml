@@ -9,8 +9,8 @@ addons:
     update: true
 
 before_script:
+  - sudo apt-get install -y cloud-image-utils qemu-kvm snapd
   - sudo snap install snapcraft --channel edge/bases
-  - sudo apt-get install -y cloud-image-utils qemu-kvm
 
 script:
   - SNAPCRAFT_BUILD_ENVIRONMENT=qemu snapcraft

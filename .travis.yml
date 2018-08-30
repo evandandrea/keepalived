@@ -3,6 +3,7 @@ git:
 
 language: shell
 dist: xenial
+sudo: required
 
 addons:
   apt:

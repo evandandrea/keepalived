@@ -1,0 +1,12 @@
+image: ubuntu
+install:
+  - sudo modprobe kvm
+  - sudo apt-get update
+  - cat /etc/apt/sources.list
+  - sudo apt-get install -y cloud-image-utils qemu-system-x86 qemu-utils snapd cpu-checker
+  - sudo snap install snapcraft --channel edge/bases --classic
+  - sudo kvm-ok
+  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft version
+  - SNAPCRAFT_BUILD_ENVIRONMENT=qemu /snap/bin/snapcraft --debug
+build: off
+test: off
